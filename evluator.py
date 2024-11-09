@@ -22,7 +22,7 @@ from sentence_transformers import SentenceTransformer
 import nltk
 nltk.download('punkt')
 
-MODEL_NAME = "google/flan-t5-small"  # Define model name here
+MODEL_NAME = ""  # Define model name here
 
 USE_GPU = True  # Set this to False if you want to use CPU instead
 

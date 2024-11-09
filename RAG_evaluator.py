@@ -26,7 +26,7 @@ from langchain.docstore.document import Document
 import nltk
 nltk.download('punkt')
 
-MODEL_NAME = "google/flan-t5-large"
+MODEL_NAME = ""
 USE_GPU = True
 
 @dataclass
@@ -38,52 +38,119 @@ class ModelConfig:
     hf_token: str = None
 
 class DocumentProcessor:
-    """Handles document processing and vectorstore creation"""
-    def __init__(self, chunk_size=500, chunk_overlap=200):
+    """Enhanced document processor with better chunking and embedding strategies"""
+    def __init__(self, chunk_size=384, chunk_overlap=50):
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             length_function=len,
-            is_separator_regex=False
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
         )
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
+            model_name="BAAI/bge-small-en-v1.5",
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
         )
 
     def process_dataset(self, dataset_name="microsoft/ms_marco", version="v2.1", 
-                       split="train[:50000]"):
-        # Load dataset
+                       split="train[:100000]"):
         ds = load_dataset(dataset_name, version, split=split)
         
-        # Process documents
         documents = []
         for idx, item in enumerate(ds):
             passages = item['passages']['passage_text']
             is_selected = item['passages']['is_selected']
             
-            for i, passage in enumerate(passages):
-                if is_selected[i] == 1:
-                    metadata = {"id": idx, "passage_idx": i}
-                    documents.append(Document(page_content=passage, metadata=metadata))
+            for i, (passage, selected) in enumerate(zip(passages, is_selected)):
+                if selected == 1:
+                    metadata = {
+                        "id": idx,
+                        "passage_idx": i,
+                        "source": "ms_marco",
+                        "query": item['query'],
+                    }
+                    cleaned_passage = self._preprocess_text(passage)
+                    documents.append(Document(page_content=cleaned_passage, metadata=metadata))
 
-        # Split documents
         docs = []
         for doc in documents:
             splits = self.text_splitter.split_text(doc.page_content)
             for i, split in enumerate(splits):
-                new_doc = Document(
-                    page_content=split,
-                    metadata={
-                        "id": doc.metadata["id"],
-                        "passage_idx": doc.metadata["passage_idx"],
-                        "chunk": i
-                    }
-                )
+                new_metadata = doc.metadata.copy()
+                new_metadata.update({"chunk": i, "total_chunks": len(splits)})
+                new_doc = Document(page_content=split, metadata=new_metadata)
                 docs.append(new_doc)
 
-        # Create vectorstore
-        vectorstore = FAISS.from_documents(docs, self.embeddings)
+        vectorstore = FAISS.from_documents(
+            docs, 
+            self.embeddings,
+            distance_strategy="COSINE"
+        )
         return vectorstore
+
+    def _preprocess_text(self, text: str) -> str:
+        """Clean and normalize text"""
+        text = text.strip()
+        text = " ".join(text.split())
+        return text
+
+def setup_qa_chain(vectorstore, model_config: ModelConfig) -> RetrievalQA:
+    """Enhanced RAG chain setup with better prompting and retrieval"""
+    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        model_config.model_name,
+        device_map="auto",  # This handles device placement automatically
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    )
+    
+    # Remove device argument from pipeline creation
+    generation_pipeline = pipeline(
+        "text2text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_length=model_config.max_length,
+        truncation=True,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50
+    )
+    llm = HuggingFacePipeline(pipeline=generation_pipeline)
+    
+    # Rest of the function remains the same
+    prompt_template = PromptTemplate(
+        input_variables=["context", "question"],
+        template="""Use the following passages to answer the question accurately and concisely.
+If you cannot find the answer in the passages, say "I cannot find a specific answer in the provided context."
+
+Relevant passages:
+{context}
+
+Question: {question}
+
+Answer: Let me provide a specific answer based on the given context."""
+    )
+    
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 5,
+            "score_threshold": 0.4,
+            "fetch_k": 20,
+            "lambda_mult": 0.7
+        }
+    )
+    
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={
+            "prompt": prompt_template,
+            "verbose": True
+        },
+        return_source_documents=True
+    )
 
 class RAGEvaluator:
     """Handles the evaluation of RAG system"""
@@ -94,7 +161,10 @@ class RAGEvaluator:
             use_stemmer=True
         )
         self.smoothing = SmoothingFunction().method1
-        self.semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+        self.semantic_model = SentenceTransformer(
+            'BAAI/bge-small-en-v1.5',  # Using the same model as embeddings for consistency
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
         self.metric_types = ['rouge', 'bleu', 'exact_match', 'semantic_similarity', 'answer_relevance']
 
     def evaluate_sample(self, question: str, reference_answer: str) -> Dict:
@@ -136,8 +206,6 @@ class RAGEvaluator:
             metrics['answer_relevance'] = float(
                 cosine_similarity(question_embedding, answer_embedding)[0][0]
             )
-            
-        metrics['num_source_docs'] = len(source_docs)
         
         return {
             'question': question,
@@ -176,52 +244,6 @@ class RAGEvaluator:
                 
         return aggregated
 
-def setup_qa_chain(vectorstore, model_config: ModelConfig) -> RetrievalQA:
-    """Sets up the RAG chain with the specified model and vectorstore"""
-    # Initialize model and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_config.model_name)
-    
-    # Create generation pipeline
-    generation_pipeline = pipeline(
-        "text2text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        max_length=model_config.max_length,
-        device=model_config.device,
-        truncation=True
-    )
-    llm = HuggingFacePipeline(pipeline=generation_pipeline)
-    
-    # Create prompt template
-    prompt_template = PromptTemplate(
-        input_variables=["context", "question"],
-        template="""Based on the following context, answer the question concisely and accurately.
-        
-Context: {context}
-Question: {question}
-
-Answer:"""
-    )
-    
-    # Setup retriever
-    retriever = vectorstore.as_retriever(
-        search_kwargs={
-            "k": 3,
-            "score_threshold": 0.5,
-            "fetch_k": 10
-        }
-    )
-    
-    # Create and return the RAG chain
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": prompt_template},
-        return_source_documents=True
-    )
-
 def load_evaluation_dataset(n_samples=100):
     """Load evaluation dataset from MS MARCO"""
     ds = load_dataset("microsoft/ms_marco", "v2.1", split=f"validation[:{n_samples}]")
@@ -238,30 +260,33 @@ def load_evaluation_dataset(n_samples=100):
     return eval_pairs
 
 def main():
+    print("\nInitializing Enhanced RAG Evaluation...")
+    print(f"Using device: {'cuda' if torch.cuda.is_available() and USE_GPU else 'cpu'}")
+    print(f"Model: {MODEL_NAME}")
+    
     # Configuration
     model_config = ModelConfig(
         model_name=MODEL_NAME,
         hf_token="your_token_here"  # Replace with your token
     )
     
-    # Initialize document processor and create vectorstore
+    print("\nProcessing documents and creating vectorstore...")
     doc_processor = DocumentProcessor()
     vectorstore = doc_processor.process_dataset()
     
-    # Setup QA chain
+    print("\nSetting up QA chain...")
     qa_chain = setup_qa_chain(vectorstore, model_config)
     
-    # Initialize evaluator
+    print("\nInitializing evaluator...")
     evaluator = RAGEvaluator(qa_chain)
     
-    # Load evaluation dataset
+    print("\nLoading evaluation dataset...")
     eval_dataset = load_evaluation_dataset(n_samples=100)
     
-    # Run evaluation
+    print("\nRunning evaluation...")
     results = evaluator.evaluate_dataset(eval_dataset)
     
     # Print results
-    print(f"\nModel: {MODEL_NAME}")
     print("\nDetailed Metrics Summary:")
     print("-" * 50)
     metrics_order = [
@@ -270,7 +295,6 @@ def main():
         'exact_match',
         'semantic_similarity',
         'answer_relevance',
-        'num_source_docs'
     ]
     
     for metric in metrics_order:
@@ -278,6 +302,7 @@ def main():
         std_key = f'std_{metric}'
         if mean_key in results['aggregated_metrics']:
             print(f"{metric:.<30} {results['aggregated_metrics'][mean_key]:.4f} ± {results['aggregated_metrics'][std_key]:.4f}")
+
 
 if __name__ == "__main__":
     main()
